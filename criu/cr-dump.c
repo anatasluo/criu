@@ -1005,21 +1005,87 @@ static int dump_task_signals(pid_t pid, struct pstree_item *item)
 
 static struct proc_pid_stat pps_buf;
 
-static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
-{
-	int i;
+#define DUMP_THREADS_STAK_SZIE 4096
+int dump_threads_num = 100; // todo: param for users
+volatile int dump_threads_status = 0; // 0 means ok
+volatile int dump_threads_finish = 0;
 
-	for (i = 0; i < item->nr_threads; i++) {
-		/* Leader is already dumped */
-		if (item->pid->real == item->threads[i].real) {
+struct dump_thread_params_context {
+	struct parasite_ctl *parasite_ctl;
+	const struct pstree_item *item;
+	char thread_stack[DUMP_THREADS_STAK_SZIE] __stack_aligned__;
+	int tid;
+	int start;
+};
+
+static int run_thread_dump_task(void *args)
+{
+	struct dump_thread_params_context *dump_threads_context = args;
+	struct parasite_ctl *parasite_ctl = dump_threads_context->parasite_ctl;
+	const struct pstree_item *item = dump_threads_context->item;
+	int i = dump_threads_context->start;
+
+	pr_info("%d begin \n", gettid());
+	// problem is item->nr_threads is too large.
+	for (; i < item->nr_threads; i += dump_threads_num) {
+		if (dump_threads_status != 0)
+			goto out;
+		else if (item->pid->real == item->threads[i].real) {
+			/* Leader is already dumped */
 			item->threads[i].ns[0].virt = vpid(item);
 			continue;
 		}
-		if (dump_task_thread(parasite_ctl, item, i))
-			return -1;
+		if (dump_task_thread(parasite_ctl, item, i)) {
+			dump_threads_status = -1;
+			goto out;
+		}
 	}
 
-	return 0;
+out:
+	pr_info("end \n");
+	__atomic_fetch_add(&dump_threads_finish, 1, __ATOMIC_SEQ_CST);
+	_exit(0);
+}
+
+static int dump_task_threads(struct parasite_ctl *parasite_ctl, const struct pstree_item *item)
+{
+	int i, status;
+	struct dump_thread_params_context *dump_thread_args = NULL;
+
+	if (item->nr_threads < dump_threads_num)
+		dump_threads_num = item->nr_threads;
+	
+	pr_info("\n Dumping core for thread begin with %d threads \n", dump_threads_num);
+
+	dump_thread_args = xzalloc(sizeof(*dump_thread_args) * dump_threads_num);
+	if (!dump_thread_args) {
+		pr_err("No memory for dump_thread_args \n");
+		return -1;
+	}
+
+	for (i = 0; i < dump_threads_num; i ++) {
+		dump_thread_args[i].parasite_ctl = parasite_ctl;
+		dump_thread_args[i].item = item;
+		dump_thread_args[i].start = i;
+		dump_thread_args[i].tid = clone(run_thread_dump_task, &(dump_thread_args[i].thread_stack[DUMP_THREADS_STAK_SZIE]),
+			CLONE_VM | CLONE_FILES | CLONE_IO | CLONE_SIGHAND | CLONE_SYSVSEM, &(dump_thread_args[i]));
+		if (dump_thread_args[i].tid == -1)
+			dump_threads_status = -1;
+	}
+
+	while (dump_threads_finish < dump_threads_num) {
+		if (dump_threads_status == -1)
+			break;
+	}
+
+	for (i = 0; i < dump_threads_num; i ++) {
+		wait4(dump_thread_args[i].tid, &status, __WALL, NULL);
+	}
+
+	xfree(dump_thread_args);
+	pr_info("\n Dumping core for thread end \n");
+
+	return dump_threads_status;
 }
 
 /*
